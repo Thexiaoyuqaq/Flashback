@@ -1,8 +1,5 @@
 package com.moulberry.flashback.playback;
 
-import ca.spottedleaf.starlight.common.chunk.ExtendedChunk;
-import ca.spottedleaf.starlight.common.light.SWMRNibbleArray;
-import ca.spottedleaf.starlight.common.light.StarLightEngine;
 import com.mojang.authlib.GameProfile;
 import com.moulberry.flashback.Flashback;
 import com.moulberry.flashback.PacketHelper;
@@ -88,10 +85,15 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
     private final BlockState FALLBACK_BLOCK_STATE = Blocks.VOID_AIR.defaultBlockState();
     private final ReplayServer replayServer;
     private final Map<UUID, PlayerInfo> playerInfoMap = new HashMap<>();
+    private final Map<UUID, List<PendingPlayerInfoUpdate>> pendingPlayerInfoUpdates = new HashMap<>();
     private Int2ObjectMap<Entity> pendingEntities = new Int2ObjectOpenHashMap<>();
     private ResourceKey<Level> currentDimension = null;
     public int localPlayerId = -1;
     public LongSet forceSendChunksDueToMovingPistonShenanigans = new LongOpenHashSet();
+
+    private record PendingPlayerInfoUpdate(EnumSet<ClientboundPlayerInfoUpdatePacket.Action> actions,
+                                           ClientboundPlayerInfoUpdatePacket.Entry entry) {
+    }
 
     public ReplayGamePacketHandler(ReplayServer replayServer) {
         this.replayServer = replayServer;
@@ -588,22 +590,7 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
 
 
         var lightData = levelChunkWithLightPacket.getLightData();
-        if (FabricLoader.getInstance().isModLoaded("starlight")) {
-            chunk.setLightCorrect(false);
-            try {
-                var blockNibbles = StarLightEngine.getFilledEmptyLight(this.level());
-                var skyNibbles = StarLightEngine.getFilledEmptyLight(this.level());
-                extractStarlightData(levelLightEngine, lightData.getBlockYMask(), lightData.getEmptyBlockYMask(), lightData.getBlockUpdates().iterator(), blockNibbles);
-                extractStarlightData(levelLightEngine, lightData.getSkyYMask(), lightData.getEmptySkyYMask(), lightData.getSkyUpdates().iterator(), skyNibbles);
-                ((ExtendedChunk)chunk).setBlockNibbles(blockNibbles);
-                ((ExtendedChunk)chunk).setSkyNibbles(skyNibbles);
-            } catch (Exception e) {
-                Flashback.LOGGER.error("Error while setting starlight light data", e);
-            }
-            chunk.setLightCorrect(true);
-        } else {
-            this.applyLightData(levelLightEngine, x, z, lightData);
-        }
+        this.applyLightData(levelLightEngine, x, z, lightData);
 
         ChunkPos chunkPos = chunk.getPos();
         ((ServerLevelExt)this.level()).flashback$markChunkAsSendable(chunkPos.toLong());
@@ -616,16 +603,7 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
         chunk.markUnsaved();
     }
 
-    private static void extractStarlightData(LevelLightEngine levelLightEngine, BitSet yMask, BitSet emptyYMask, Iterator<byte[]> iterator, SWMRNibbleArray[] nibbles) {
-        for (int index = 0; index < levelLightEngine.getLightSectionCount(); index++) {
-            boolean hasData = yMask.get(index);
-            boolean isEmpty = emptyYMask.get(index);
-            if (hasData || isEmpty) {
-                var dataLayer = hasData ? new DataLayer(iterator.next().clone()) : new DataLayer();
-                nibbles[index] = SWMRNibbleArray.fromVanilla(dataLayer);
-            }
-        }
-    }
+
 
     private void applyLightData(LevelLightEngine levelLightEngine, int x, int z, ClientboundLightUpdatePacketData clientboundLightUpdatePacketData) {
         levelLightEngine.retainData(new ChunkPos(x, z), true);
@@ -936,6 +914,7 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
     public void handlePlayerInfoRemove(ClientboundPlayerInfoRemovePacket clientboundPlayerInfoRemovePacket) {
         for (UUID uuid : clientboundPlayerInfoRemovePacket.profileIds()) {
             this.playerInfoMap.remove(uuid);
+            this.pendingPlayerInfoUpdates.remove(uuid);
         }
         forward(clientboundPlayerInfoRemovePacket);
     }
@@ -943,16 +922,45 @@ public class ReplayGamePacketHandler implements ClientGamePacketListener {
     @Override
     public void handlePlayerInfoUpdate(ClientboundPlayerInfoUpdatePacket clientboundPlayerInfoUpdatePacket) {
         for (ClientboundPlayerInfoUpdatePacket.Entry entry : clientboundPlayerInfoUpdatePacket.newEntries()) {
-            PlayerInfo playerInfo = new PlayerInfo(Objects.requireNonNull(entry.profile()), false);
-            this.playerInfoMap.putIfAbsent(entry.profileId(), playerInfo);
+            PlayerInfo playerInfo = this.playerInfoMap.computeIfAbsent(entry.profileId(),
+                uuid -> new PlayerInfo(Objects.requireNonNull(entry.profile()), false));
+            this.applyPendingPlayerInfoUpdates(entry.profileId(), playerInfo);
         }
         for (ClientboundPlayerInfoUpdatePacket.Entry entry : clientboundPlayerInfoUpdatePacket.entries()) {
             var playerInfo = this.playerInfoMap.get(entry.profileId());
+            if (playerInfo == null) {
+                this.queuePendingPlayerInfoUpdate(clientboundPlayerInfoUpdatePacket.actions(), entry);
+                continue;
+            }
             for (ClientboundPlayerInfoUpdatePacket.Action action : clientboundPlayerInfoUpdatePacket.actions()) {
                 this.applyPlayerInfoUpdate(action, entry, playerInfo);
             }
         }
         forward(clientboundPlayerInfoUpdatePacket);
+    }
+
+    private void queuePendingPlayerInfoUpdate(EnumSet<ClientboundPlayerInfoUpdatePacket.Action> actions,
+                                              ClientboundPlayerInfoUpdatePacket.Entry entry) {
+        if (actions.contains(ClientboundPlayerInfoUpdatePacket.Action.ADD_PLAYER)) {
+            return;
+        }
+
+        this.pendingPlayerInfoUpdates
+            .computeIfAbsent(entry.profileId(), uuid -> new ArrayList<>())
+            .add(new PendingPlayerInfoUpdate(EnumSet.copyOf(actions), entry));
+    }
+
+    private void applyPendingPlayerInfoUpdates(UUID uuid, PlayerInfo playerInfo) {
+        List<PendingPlayerInfoUpdate> pendingUpdates = this.pendingPlayerInfoUpdates.remove(uuid);
+        if (pendingUpdates == null) {
+            return;
+        }
+
+        for (PendingPlayerInfoUpdate pendingUpdate : pendingUpdates) {
+            for (ClientboundPlayerInfoUpdatePacket.Action action : pendingUpdate.actions()) {
+                this.applyPlayerInfoUpdate(action, pendingUpdate.entry(), playerInfo);
+            }
+        }
     }
 
     private void applyPlayerInfoUpdate(ClientboundPlayerInfoUpdatePacket.Action action, ClientboundPlayerInfoUpdatePacket.Entry entry, PlayerInfo playerInfo) {
